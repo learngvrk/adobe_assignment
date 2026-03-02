@@ -1,0 +1,19 @@
+# Search engine configuration
+# ----------------------------
+# Add new engines or keyword params here — no code deployment needed.
+# site_domain: used to distinguish internal referrers from external ones.
+
+site_domain = "esshopzilla.com"
+
+search_engine_domains = [
+    "google",
+    "bing",
+    "yahoo",
+    "duckduckgo",
+    "msn",
+    "ask",
+    "aol",
+]
+
+# Tried in order — first match wins.
+keyword_params = ["q", "p", "query", "search"]
