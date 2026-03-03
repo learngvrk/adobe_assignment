@@ -13,3 +13,7 @@ artifacts/
 .venv/
 venv/
 env/
+build/
+scripts/
+src/lambda/
+terraform/

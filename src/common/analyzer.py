@@ -81,7 +81,7 @@ class SessionAwareAnalyzer:
         Serialize results to a tab-delimited string and generate the output
         filename: YYYY-mm-dd_SearchKeywordPerformance.tab
         """
-        date = execution_date or datetime.utcnow()
+        date = execution_date or datetime.now(tz=None)
         filename = f"{date.strftime('%Y-%m-%d')}_SearchKeywordPerformance.tab"
 
         if not results:
