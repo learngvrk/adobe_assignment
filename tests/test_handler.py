@@ -1,6 +1,6 @@
 """Tests for src/lambda/handler.py — Lambda entry point with mocked S3."""
 
-import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,12 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 SAMPLE_DATA = Path(__file__).parent.parent / "requirements" / "data[98].sql"
+HANDLER_PATH = Path(__file__).parent.parent / "src" / "lambda" / "handler.py"
 
-# Ensure src/ is on path before importing the handler module
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-# 'lambda' is a Python keyword — use importlib to import
-handler_module = importlib.import_module("lambda.handler")
+# 'lambda' is a Python reserved keyword — cannot use importlib.import_module().
+# Load the module directly from its file path instead.
+spec = importlib.util.spec_from_file_location("lambda_handler", HANDLER_PATH)
+handler_module = importlib.util.module_from_spec(spec)
+sys.modules["lambda_handler"] = handler_module
+spec.loader.exec_module(handler_module)
 
 
 @pytest.fixture
