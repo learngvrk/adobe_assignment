@@ -1,15 +1,21 @@
 """Tests for src/lambda/handler.py — Lambda entry point with mocked S3."""
 
-import importlib
+import importlib.util
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 SAMPLE_DATA = Path(__file__).parent.parent / "requirements" / "data[98].sql"
+HANDLER_PATH = Path(__file__).parent.parent / "src" / "lambda" / "handler.py"
 
-# 'lambda' is a Python keyword — use importlib to import the module
-handler_module = importlib.import_module("lambda.handler")
+# 'lambda' is a Python reserved keyword — cannot use importlib.import_module().
+# Load the module directly from its file path instead.
+spec = importlib.util.spec_from_file_location("lambda_handler", HANDLER_PATH)
+handler_module = importlib.util.module_from_spec(spec)
+sys.modules["lambda_handler"] = handler_module
+spec.loader.exec_module(handler_module)
 
 
 @pytest.fixture
@@ -32,7 +38,6 @@ def s3_event():
     }
 
 
-@patch.dict("os.environ", {"OUTPUT_BUCKET": "test-output-bucket", "OUTPUT_PREFIX": "results/"})
 @patch.object(handler_module, "s3")
 @patch.object(handler_module, "OUTPUT_BUCKET", "test-output-bucket")
 @patch.object(handler_module, "OUTPUT_PREFIX", "results/")

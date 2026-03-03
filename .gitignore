@@ -15,5 +15,5 @@ venv/
 env/
 build/
 scripts/
-src/lambda/
+# src/lambda/
 terraform/
