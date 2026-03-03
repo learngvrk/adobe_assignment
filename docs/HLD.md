@@ -223,7 +223,7 @@ The 30-minute inactivity timeout is the **industry standard** used by both Googl
 | # | Decision | Chosen | Alternatives Considered | Rationale |
 |---|---|---|---|---|
 | 1 | **Attribution model** | Session first-touch | Row-level, last-touch | Row-level produces zero results on this data. First-touch matches Adobe Analytics default attribution model. |
-| 2 | **DataFrame library** | Polars | pandas, pure Python stdlib, DuckDB | Polars: ~15MB footprint (vs ~60MB pandas), native window functions for session logic, faster on columnar ops. DuckDB: unnecessary SQL layer for this use case. Pure Python: imperative loops are harder to maintain. |
+| 2 | **SQL engine** | DuckDB | Polars, pandas, pure Python stdlib | DuckDB's SQL is portable across tiers — the same `attribution.sql` runs on DuckDB (Lambda/CLI) and Spark SQL (EMR) with zero dialect changes. Polars API doesn't translate to PySpark, requiring two separate codebases. Both DuckDB (~40MB) and Polars (~46MB) fit within Lambda's 250MB limit. |
 | 3 | **Config format** | TOML + `tomllib` | YAML + PyYAML, JSON, hardcoded dict | `tomllib` is Python 3.11+ stdlib — zero external dependencies. TOML is human-readable and supports comments. YAML requires PyYAML (extra dep). |
 | 4 | **Session timeout** | 30 minutes | 15 min, 60 min, `visit_num` column | Industry standard matching both Google Analytics and Adobe Analytics defaults. `visit_num` was not available in this dataset. |
 | 5 | **Infrastructure** | Terraform | CloudFormation, SAM, CDK | Cloud-agnostic HCL, modular structure, readable plans. SAM is AWS-specific and YAML-heavy. |
@@ -245,10 +245,14 @@ adobe_assignment/
 │   │   ├── search_engines.toml        # Externalized config — no code deploy for changes
 │   │   ├── config.py                  # TOML loader (stdlib tomllib)
 │   │   ├── url_parser.py              # Pure functions: parse_domain, parse_keyword
-│   │   └── analyzer.py               # SessionAwareAnalyzer class
-│   └── lambda/                        # AWS Lambda entry point
-│       ├── __init__.py
-│       └── handler.py                 # S3-triggered handler
+│   │   ├── analyzer.py               # SessionAwareAnalyzer class (DuckDB engine)
+│   │   └── sql/
+│   │       └── attribution.sql        # Shared SQL — runs on DuckDB + Spark SQL
+│   ├── lambda/                        # AWS Lambda entry point
+│   │   ├── __init__.py
+│   │   └── handler.py                 # S3-triggered handler
+│   └── emr/                           # Spark EMR entry point
+│       └── spark_job.py               # PySpark job — same SQL, distributed
 ├── tests/                             # 57 pytest tests
 │   ├── conftest.py                    # Shared fixtures + TSV builder
 │   ├── test_url_parser.py             # URL parsing edge cases
@@ -321,24 +325,34 @@ All parsing uses `urllib.parse` (stdlib) — no regex. This handles URL encoding
 
 ### 8.4 `analyzer.py` — SessionAwareAnalyzer
 
-The core business logic class. Uses Polars for declarative DataFrame operations.
+The core business logic class. Uses **DuckDB** as the SQL engine with a **shared SQL query** (`sql/attribution.sql`) that is portable between DuckDB (Lambda/CLI) and Spark SQL (EMR).
 
 **Public API:**
 - `process(tsv_content: str) -> list[dict]` — end-to-end processing
 - `to_tab_delimited(results, execution_date) -> (filename, content)` — output serialization
 
-**Internal pipeline** (`_attribute_sessions`):
+**Pipeline (two phases):**
 
-| Step | Polars Operation | Purpose |
+**Phase 1 — Python enrichment** (`_enrich`): Pre-computes four columns on each row using Python:
+
+| Column | Source | Purpose |
 |---|---|---|
-| 1 | `cast + sort` | Order hits by visitor + time |
-| 2 | `diff().over(visitor)` | Compute inactivity gaps |
-| 3 | `gap > 1800` | Detect session breaks |
-| 4 | `cum_sum().over(visitor)` | Assign session IDs |
-| 5 | `map_elements(parse_domain/keyword)` | Extract search engine info |
-| 6 | `filter + group_by + first` | First-touch per session |
-| 7 | `filter(is_purchase & revenue > 0)` | Identify purchase rows |
-| 8 | `join(on=session_key)` | Attribute purchases to first-touch |
+| `_domain` | `parse_domain(referrer)` | Normalized search engine domain |
+| `_keyword` | `parse_keyword(referrer)` | Extracted and normalized search keyword |
+| `_is_purchase` | `_is_purchase(event_list)` | Boolean purchase flag |
+| `_revenue` | `_extract_revenue(product_list)` | Summed revenue as float |
+
+**Phase 2 — DuckDB SQL** (`attribution.sql`): Pure SQL operating on the enriched columns:
+
+| CTE | SQL Operation | Purpose |
+|---|---|---|
+| `gaps` | `LAG() OVER (PARTITION BY ip, user_agent)` | Compute inactivity gaps |
+| `sessions` | `SUM(CASE gap > 1800) OVER (...)` | Assign session IDs via cumulative sum |
+| `first_touch` | `FIRST(_domain), FIRST(_keyword) GROUP BY session` | First-touch per session |
+| `purchases` | `WHERE _is_purchase` | Identify purchase rows |
+| Final | `JOIN purchases ON session → GROUP BY → ORDER BY` | Aggregate and sort |
+
+**Why two phases?** DuckDB's Python UDF registration requires numpy. By pre-computing in Python and using pure SQL for attribution, we eliminate the numpy dependency (~25MB) and keep the SQL truly portable — the same `attribution.sql` runs on both DuckDB and Spark SQL without modification.
 
 **Static helpers:**
 - `_is_purchase(event_list)` — checks for event code "1" (exact match, not substring)
@@ -366,7 +380,47 @@ Config and analyzer are initialized **once at cold start** and reused across war
 
 ## 9. AWS Infrastructure
 
-### Architecture Diagram
+### Three-Tier Architecture
+
+The system is designed with two processing tiers, selected based on file size, plus a CLI tier for development and assessment requirements:
+
+```
+                           ┌─────────────────────┐
+                           │    S3 Input Bucket    │
+                           │    (*.tsv upload)     │
+                           └───────────┬───────────┘
+                                       │
+                      ┌────────────────┼────────────────┐
+                      │                │                 │
+                 File < 3 GB      File > 3 GB        CLI / Dev
+                      │                │                 │
+                      ▼                ▼                 ▼
+          ┌───────────────────┐ ┌──────────────┐ ┌──────────────┐
+          │  Lambda + DuckDB  │ │  Spark EMR   │ │   CLI +      │
+          │  (Python 3.12)    │ │  Serverless  │ │   DuckDB     │
+          │                   │ │              │ │              │
+          │  Same SQL query   │ │  Same SQL    │ │  Same SQL    │
+          │  (attribution.sql)│ │  query       │ │  query       │
+          └─────────┬─────────┘ └──────┬───────┘ └──────┬───────┘
+                    │                  │                 │
+                    ▼                  ▼                 ▼
+          ┌───────────────────┐ ┌──────────────┐ ┌──────────────┐
+          │  S3 Output Bucket │ │  S3 Output   │ │  Local .tab  │
+          │  (*.tab results)  │ │  Bucket      │ │  file        │
+          └───────────────────┘ └──────────────┘ └──────────────┘
+```
+
+### Why Three Tiers?
+
+| Tier | Engine | File Size | Use Case | Cost Model |
+|---|---|---|---|---|
+| **Lambda + DuckDB** | DuckDB in-memory | < 3 GB | Real-time event-driven processing | Pay-per-invocation, zero idle |
+| **Spark EMR Serverless** | Spark SQL | 3 GB — 100+ GB | Production at scale (Adobe processes hundreds of clients) | Pay-per-second, auto-scales |
+| **CLI + DuckDB** | DuckDB in-memory | Local files | Development, testing, assessment requirement #3 | Free |
+
+**Key design principle**: All three tiers share the same `attribution.sql` query and `url_parser.py` functions. The SQL is portable — DuckDB SQL and Spark SQL both support the same window functions and CTEs used in the attribution logic.
+
+### Lambda Architecture Detail
 
 ```
                     ┌──────────────────┐
@@ -381,6 +435,7 @@ Config and analyzer are initialized **once at cold start** and reused across war
                     ┌──────────────────┐
                     │  Lambda Function  │
                     │  (Python 3.12)    │
+                    │  DuckDB engine    │
                     │                   │
                     │  SessionAware     │
                     │  Analyzer         │
@@ -423,7 +478,7 @@ No `s3:*`, no `*` resources — least privilege.
 | 3 | Application accepts a single argument (file to process) | Done | `src/main.py` reads `sys.argv[1]` |
 | 4 | Tab-delimited output with Search Engine Domain, Search Keyword, Revenue | Done | `to_tab_delimited()` produces exact columns |
 | 5 | Header row included | Done | `OUTPUT_COLUMNS` constant |
-| 6 | Sorted by revenue descending | Done | `.sort("Revenue", descending=True)` |
+| 6 | Sorted by revenue descending | Done | `ORDER BY "Revenue" DESC` in attribution SQL |
 | 7 | Filename: `YYYY-mm-dd_SearchKeywordPerformance.tab` | Done | Date-formatted in `to_tab_delimited()` |
 | **Bonus** | Unit test cases | Done | 57 pytest tests across 6 test files |
 | **Bonus** | Serverless deployment scripts | Done | Terraform IaC + `package_lambda.sh` |
@@ -457,50 +512,75 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and PR:
 
 The assessment notes: *"Our team deals with extremely large files, over 10 GB per file uncompressed."*
 
-### Current Solution: Lambda (Small Files)
+### Tier 1: Lambda + DuckDB (< 3 GB)
 
 | Dimension | Capability |
 |---|---|
-| **File size** | Up to ~500MB (Lambda memory limit: 10GB, but Polars needs ~3x file size in memory) |
+| **File size** | Up to ~3 GB (Lambda allows 10 GB memory; DuckDB needs ~2-3x file size in RAM) |
 | **Concurrency** | Auto-scales — each file upload triggers an independent Lambda invocation |
 | **Cost** | Pay-per-invocation — zero idle cost |
-| **Cold start** | ~2-3 seconds (Polars binary loading) |
+| **Cold start** | ~1-2 seconds (DuckDB is lightweight) |
+| **Timeout** | 15 minutes max — sufficient for 3 GB files |
+| **Temp storage** | 10 GB `/tmp` — used for DuckDB temp files |
 
-### Scaling to 10GB+: EMR Serverless with PySpark
+**Why Lambda caps at ~3 GB, not 10 GB**: DuckDB's in-memory SQL engine needs ~2-3x the file size for sorting, window functions, and joins. A 3 GB TSV file needs ~6-9 GB RAM, fitting within Lambda's 10 GB limit. A 10 GB file would require ~20-30 GB RAM — exceeding Lambda.
 
-For files exceeding Lambda's capacity, the architecture scales to **EMR Serverless** running PySpark:
+### Tier 2: Spark EMR Serverless (3 GB — 100+ GB)
 
-| Aspect | Lambda | EMR Serverless |
+For files exceeding Lambda's capacity, the architecture scales to **EMR Serverless** running Spark SQL:
+
+| Aspect | Lambda + DuckDB | Spark EMR Serverless |
 |---|---|---|
-| **File size** | < 500MB | 10GB+ (distributed processing) |
+| **File size** | < 3 GB | 3 GB — 100+ GB (distributed) |
 | **Processing** | Single-node, in-memory | Multi-node, partitioned |
-| **Shared code** | `url_parser.py` functions | Same functions as Spark UDFs |
+| **SQL query** | Same `attribution.sql` | Same SQL via Spark SQL |
+| **URL parsers** | Same `url_parser.py` | Same functions as Spark UDFs |
 | **Config** | Same `search_engines.toml` | Same TOML file |
-| **Output** | Single `.tab` file | Partitioned by search engine domain |
+| **Cost** | Pay-per-invocation | Pay-per-second, auto-scales |
+| **Cold start** | ~1-2 seconds | 10 seconds — 3 minutes |
 
-The `url_parser.py` functions were deliberately designed as **pure stateless functions** (not class methods) so they register directly as Spark UDFs without modification:
+**Why Spark EMR for scale?** Adobe processes hit-level data for hundreds of clients at production scale. The sample data (22 rows, 1 client) is tiny — in production, a single client's data can be 10 GB+, and the platform serves hundreds of clients simultaneously. Spark's distributed processing handles this natively with data partitioning across worker nodes.
+
+### Shared SQL: The Key to Portability
+
+The same `attribution.sql` query runs on both DuckDB and Spark SQL because:
+
+1. **Window functions** (`LAG`, `SUM OVER`) are standard SQL — supported by both engines
+2. **CTEs** (`WITH ... AS`) are standard SQL — supported by both engines
+3. **Aggregation** (`GROUP BY`, `SUM`, `FIRST`) — supported by both engines
+4. **Pre-computed columns** (`_domain`, `_keyword`, `_is_purchase`, `_revenue`) eliminate engine-specific UDF registration
+
+On **Spark**, the enrichment phase uses PySpark UDFs instead of Python csv processing:
 
 ```python
 from common.url_parser import parse_domain, parse_keyword
 
-parse_domain_udf = udf(parse_domain, StringType())
-parse_keyword_udf = udf(parse_keyword, StringType())
+parse_domain_udf = udf(lambda ref: parse_domain(ref, domains), StringType())
+parse_keyword_udf = udf(lambda ref: parse_keyword(ref, keyword_params), StringType())
+
+df = df.withColumn("_domain", parse_domain_udf(col("referrer")))
+df = df.withColumn("_keyword", parse_keyword_udf(col("referrer")))
 ```
 
-The session logic (sort → gap detection → cumulative session ID) maps directly to PySpark window functions:
+Then the same attribution SQL runs via `spark.sql(attribution_sql)`.
 
-```python
-window = Window.partitionBy("ip", "user_agent").orderBy("hit_time_gmt")
-df = df.withColumn("gap", col("hit_time_gmt") - lag("hit_time_gmt").over(window))
-df = df.withColumn("session_break", when(col("gap") > 1800, 1).otherwise(0))
-df = df.withColumn("session_id", sum("session_break").over(window))
-```
+### Lambda Constraint Analysis
+
+| Lambda Limit | Value | Impact on 10 GB Files |
+|---|---|---|
+| **Memory** | 10 GB max | Insufficient — DuckDB needs ~20-30 GB for 10 GB file |
+| **Timeout** | 15 minutes | Borderline — DuckDB can process 3 GB in ~5 min |
+| **Temp storage** | 10 GB `/tmp` | Matches file size but no room for DuckDB spill files |
+| **CPU** | Up to 6 vCPUs at 10 GB RAM | Session attribution is single-threaded (global sort) |
+| **Payload** | 6 MB sync / 256 KB async | Must read from S3, not inline |
+
+**Threading consideration**: Python's GIL blocks CPU parallelism. `multiprocessing.Pool` fails in Lambda (no `/dev/shm`). DuckDB uses its own internal threads for SQL execution, but the session attribution requires a global sort — inherently sequential.
 
 ### Additional Scaling Strategies
 
 | Strategy | Benefit |
 |---|---|
-| **Lazy evaluation** (Polars `.scan_csv()`) | Process files larger than RAM via streaming |
+| **DuckDB out-of-core** | DuckDB can spill to disk for datasets larger than RAM via `/tmp` |
 | **Partitioned input** | Split large files by date/region before processing |
 | **S3 Select** | Push filtering to S3 — only read rows with external referrers |
 | **Compression** | Accept gzipped TSV — reduces I/O time significantly |
@@ -511,8 +591,9 @@ df = df.withColumn("session_id", sum("session_break").over(window))
 
 | Item | Priority | Description |
 |---|---|---|
-| **EMR Serverless Spark job** | High | `src/emr/spark_job.py` — reuses `url_parser.py` as UDFs, same TOML config, partitioned output |
+| **EMR Serverless Spark job** | High | `src/emr/spark_job.py` — reuses `attribution.sql` via Spark SQL, `url_parser.py` as UDFs, same TOML config |
+| **Tier routing** | High | S3 event → Step Functions: route to Lambda (< 3 GB) or EMR (> 3 GB) based on `ContentLength` |
 | **README** | Medium | Setup instructions, quickstart, architecture overview |
 | **.gitignore** | Low | Exclude `build/`, `__pycache__/`, `.terraform/`, `*.tfstate` |
-| **Monitoring** | Future | CloudWatch alarms for Lambda errors, S3 lifecycle policies for old files |
+| **Monitoring** | Future | CloudWatch alarms for Lambda errors, EMR job metrics, S3 lifecycle policies |
 | **Data validation** | Future | Schema validation on input TSV before processing |
