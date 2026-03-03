@@ -4,6 +4,9 @@ SessionAwareAnalyzer
 Session-level first-touch attribution of e-commerce revenue to external
 search engine keywords from Adobe Analytics hit-level TSV data.
 
+Uses DuckDB as the SQL engine — the same attribution SQL runs on both
+DuckDB (Lambda/CLI) and Spark SQL (EMR) with minimal dialect changes.
+
 Session rules:
     - Session key   : ip + user_agent
     - Session break : inactivity gap > 30 minutes between consecutive hits
@@ -16,26 +19,29 @@ Why need session-aware?
     Row-level attribution produces zero results on this dataset.
 """
 
+import csv
 import io
 import logging
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-import polars as pl
+import duckdb
 
 from .url_parser import parse_domain, parse_keyword
 
 logger = logging.getLogger(__name__)
 
-SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — industry standard
+_SQL_PATH = Path(__file__).parent / "sql" / "attribution.sql"
 
 
 class SessionAwareAnalyzer:
     """
-    Parses Adobe Analytics hit-level TSV data
+    Parses Adobe Analytics hit-level TSV data using DuckDB SQL.
 
-    Framework-agnostic: used directly by the Lambda handler (small files)
-    and as the domain-logic layer by the EMR Serverless PySpark job (large files).
+    The attribution logic lives in a shared SQL file (sql/attribution.sql)
+    that is portable between DuckDB and Spark SQL.
     """
 
     OUTPUT_COLUMNS = ["Search Engine Domain", "Search Keyword", "Revenue"]
@@ -49,6 +55,7 @@ class SessionAwareAnalyzer:
         self.domains: list[str] = config["search_engine_domains"]
         self.keyword_params: list[str] = config["keyword_params"]
         self.site_domain: str = config.get("site_domain", "")
+        self._sql = _SQL_PATH.read_text()
 
     # ------------------------------------------------------------------
     # Public Methods
@@ -57,6 +64,12 @@ class SessionAwareAnalyzer:
         """
         Parse a full TSV string and return aggregated revenue records.
 
+        Pipeline:
+            1. Parse TSV and enrich each row with pre-computed columns
+               (_domain, _keyword, _is_purchase, _revenue) using Python.
+            2. Load enriched data into DuckDB in-memory table.
+            3. Execute the shared attribution SQL (pure SQL, no UDFs).
+
         Args:
             tsv_content: Raw tab-separated content of the hit-level data file.
 
@@ -64,13 +77,39 @@ class SessionAwareAnalyzer:
             List of dicts with keys: Search Engine Domain, Search Keyword,
             Revenue — sorted by Revenue descending.
         """
-        df = pl.read_csv(
-            io.StringIO(tsv_content),
-            separator="\t",
-            infer_schema=False,
-        )
-        attributed = self._attribute_sessions(df)
-        return self._aggregate_and_sort(attributed)
+        enriched_tsv = self._enrich(tsv_content)
+
+        # Fast path: header-only input has no data rows to process
+        line_count = enriched_tsv.count("\n")
+        if line_count <= 1:
+            return []
+
+        con = duckdb.connect(":memory:")
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".tsv", delete=False
+            ) as tmp:
+                tmp.write(enriched_tsv)
+                tmp_path = tmp.name
+
+            con.execute(
+                "CREATE TABLE hits AS SELECT * FROM read_csv_auto(?, "
+                "delim='\\t', header=true, all_varchar=false)",
+                [tmp_path],
+            )
+            Path(tmp_path).unlink(missing_ok=True)
+
+            result = con.execute(self._sql).fetchall()
+            return [
+                {
+                    "Search Engine Domain": row[0],
+                    "Search Keyword": row[1],
+                    "Revenue": float(row[2]),
+                }
+                for row in result
+            ]
+        finally:
+            con.close()
 
     def to_tab_delimited(
         self,
@@ -84,153 +123,57 @@ class SessionAwareAnalyzer:
         date = execution_date or datetime.now(tz=None)
         filename = f"{date.strftime('%Y-%m-%d')}_SearchKeywordPerformance.tab"
 
+        header = "\t".join(self.OUTPUT_COLUMNS) + "\n"
         if not results:
-            header = "\t".join(self.OUTPUT_COLUMNS) + "\n"
             return filename, header
 
-        df = pl.DataFrame(results, schema=self.OUTPUT_COLUMNS)
-        df = df.with_columns(
-            pl.col("Revenue").map_elements(
-                lambda v: f"{v:.2f}", return_dtype=pl.Utf8
+        lines = [header]
+        for r in results:
+            lines.append(
+                f"{r['Search Engine Domain']}\t"
+                f"{r['Search Keyword']}\t"
+                f"{r['Revenue']:.2f}\n"
             )
-        )
-        content = df.write_csv(separator="\t", line_terminator="\n")
-
-        return filename, content
+        return filename, "".join(lines)
 
     # ------------------------------------------------------------------
-    # Session attribution (polars)
-    # ------------------------------------------------------------------
+    # Pre-processing: enrich raw TSV with computed columns
 
-    def _attribute_sessions(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _enrich(self, tsv_content: str) -> str:
         """
-        Core session logic — declarative Polars operations.
+        Parse the raw TSV and append four computed columns:
+            _domain      : search engine domain from referrer (or empty)
+            _keyword     : search keyword from referrer (or empty)
+            _is_purchase : true/false
+            _revenue     : extracted revenue as float
 
-        1. Sort by (ip, user_agent, hit_time_gmt).
-        2. Compute inactivity gaps per visitor.
-        3. Detect session breaks (timeout > 30 min).
-        4. Assign session IDs via cumulative sum of break flags.
-        5. Extract first-touch search referrer per session.
-        6. Join back to purchase rows and extract revenue.
-
-        Returns:
-            DataFrame with columns: Search Engine Domain, Search Keyword, Revenue
+        Returns a new TSV string with the enriched columns.
         """
-        visitor = ["ip", "user_agent"]
+        reader = csv.DictReader(io.StringIO(tsv_content), delimiter="\t")
+        if not reader.fieldnames:
+            return tsv_content
 
-        # Cast timestamp, sort by visitor + time
-        df = (
-            df.with_columns(
-                pl.col("hit_time_gmt").cast(pl.Int64, strict=False).fill_null(0)
-            )
-            .sort(visitor + ["hit_time_gmt"])
-        )
+        out_fields = list(reader.fieldnames) + [
+            "_domain", "_keyword", "_is_purchase", "_revenue",
+        ]
 
-        # Inactivity gap between consecutive hits per visitor
-        df = df.with_columns(
-            pl.col("hit_time_gmt").diff().over(visitor).fill_null(0).alias("gap")
-        )
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=out_fields, delimiter="\t",
+                                lineterminator="\n")
+        writer.writeheader()
 
-        # Parse domain + keyword from referrer
-        domains = self.domains
-        keyword_params = self.keyword_params
+        for row in reader:
+            referrer = row.get("referrer", "")
+            row["_domain"] = parse_domain(referrer, self.domains) or ""
+            row["_keyword"] = parse_keyword(referrer, self.keyword_params) or ""
+            row["_is_purchase"] = str(self._is_purchase(row.get("event_list", "")))
+            row["_revenue"] = str(self._extract_revenue(row.get("product_list", "")))
+            writer.writerow(row)
 
-        df = df.with_columns(
-            pl.col("referrer").map_elements(
-                lambda r: parse_domain(r, domains),
-                return_dtype=pl.Utf8,
-            ).alias("domain"),
-            pl.col("referrer").map_elements(
-                lambda r: parse_keyword(r, keyword_params),
-                return_dtype=pl.Utf8,
-            ).alias("keyword"),
-        )
-
-        # Session break: inactivity > 30 minutes
-        df = df.with_columns(
-            (pl.col("gap") > SESSION_TIMEOUT_SECONDS).alias("session_break")
-        )
-
-        # Session ID per visitor — cumulative sum of breaks
-        df = df.with_columns(
-            pl.col("session_break")
-            .cast(pl.Int32)
-            .cum_sum()
-            .over(visitor)
-            .alias("session_id")
-        )
-
-        session_key = visitor + ["session_id"]
-
-        # First-touch: first search referrer per session
-        first_touch = (
-            df.filter(pl.col("domain").is_not_null() & pl.col("keyword").is_not_null())
-            .group_by(session_key, maintain_order=True)
-            .first()
-            .select(
-                session_key
-                + [
-                    pl.col("domain").alias("Search Engine Domain"),
-                    pl.col("keyword").alias("Search Keyword"),
-                ]
-            )
-        )
-
-        if first_touch.is_empty():
-            return pl.DataFrame(
-                schema={
-                    "Search Engine Domain": pl.Utf8,
-                    "Search Keyword": pl.Utf8,
-                    "Revenue": pl.Float64,
-                }
-            )
-
-        # Purchase rows with revenue
-        purchases = (
-            df.with_columns(
-                pl.col("event_list")
-                .map_elements(self._is_purchase, return_dtype=pl.Boolean)
-                .alias("is_purchase"),
-                pl.col("product_list")
-                .map_elements(self._extract_revenue, return_dtype=pl.Float64)
-                .alias("Revenue"),
-            )
-            .filter(pl.col("is_purchase") & (pl.col("Revenue") > 0))
-        )
-
-        if purchases.is_empty():
-            return pl.DataFrame(
-                schema={
-                    "Search Engine Domain": pl.Utf8,
-                    "Search Keyword": pl.Utf8,
-                    "Revenue": pl.Float64,
-                }
-            )
-
-        # Join purchases to their session's first-touch
-        attributed = purchases.join(first_touch, on=session_key, how="inner")
-
-        return attributed.select(["Search Engine Domain", "Search Keyword", "Revenue"])
+        return output.getvalue()
 
     # ------------------------------------------------------------------
-    # Aggregation and sorting of the final results
-
-    def _aggregate_and_sort(self, attributed: pl.DataFrame) -> list[dict]:
-        """Aggregate revenue by (domain, keyword) and sort descending."""
-        if attributed.is_empty():
-            return []
-
-        return (
-            attributed.group_by(
-                ["Search Engine Domain", "Search Keyword"], maintain_order=True
-            )
-            .agg(pl.col("Revenue").sum())
-            .sort("Revenue", descending=True)
-            .to_dicts()
-        )
-
-    # ------------------------------------------------------------------
-    # helper functions for session attribution
+    # Helper functions (pure Python, also usable as Spark UDFs)
 
     @staticmethod
     def _is_purchase(event_list: str) -> bool:
