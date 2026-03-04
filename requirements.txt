@@ -1,0 +1,6 @@
+# Runtime
+duckdb>=1.0.0
+boto3>=1.28.0
+
+# Development / Testing
+pytest>=8.0.0
