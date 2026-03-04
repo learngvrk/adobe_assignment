@@ -23,7 +23,7 @@ import csv
 import io
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -85,6 +85,7 @@ class SessionAwareAnalyzer:
             return []
 
         con = duckdb.connect(":memory:")
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".tsv", delete=False
@@ -97,7 +98,6 @@ class SessionAwareAnalyzer:
                 "delim='\\t', header=true, all_varchar=false)",
                 [tmp_path],
             )
-            Path(tmp_path).unlink(missing_ok=True)
 
             result = con.execute(self._sql).fetchall()
             return [
@@ -109,6 +109,8 @@ class SessionAwareAnalyzer:
                 for row in result
             ]
         finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
             con.close()
 
     def to_tab_delimited(
@@ -120,7 +122,7 @@ class SessionAwareAnalyzer:
         Serialize results to a tab-delimited string and generate the output
         filename: YYYY-mm-dd_SearchKeywordPerformance.tab
         """
-        date = execution_date or datetime.now(tz=None)
+        date = execution_date or datetime.now(tz=timezone.utc)
         filename = f"{date.strftime('%Y-%m-%d')}_SearchKeywordPerformance.tab"
 
         header = "\t".join(self.OUTPUT_COLUMNS) + "\n"

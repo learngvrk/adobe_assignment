@@ -1,14 +1,104 @@
-# Search Keyword Performance
+# Search Keyword Revenue Attribution
 
-Analyzing revenue attribution from external search engines using Adobe Analytics hit-level data.
+Revenue attribution from external search engines using Adobe Analytics hit-level data. Determines which search keywords drive the most revenue through session-aware first-touch attribution.
 
-## Problem
-Determine how much revenue the client is generating from external search engines (Google, Yahoo, Bing)
-and identify which search keywords are driving the most revenue.
+## Business Problem
 
-## Data
-Hit-level TSV data from Adobe Analytics. Each row is a single page hit.
-Key fields: `event_list`, `referrer`, `product_list`
+> How much revenue is the client getting from external Search Engines, such as Google, Yahoo and MSN, and which keywords are performing the best based on revenue?
 
-## Approach
-Work in progress.
+The client's e-commerce site (esshopzilla.com) collects Adobe Analytics hit-level data. This pipeline connects **search engine keywords** to **actual revenue**, enabling the client to measure ROI on their search strategy.
+
+## Architecture
+
+Three-tier design with a shared SQL attribution query (`sql/attribution.sql`) across all tiers:
+
+| Tier | Engine | File Size | Use Case |
+|---|---|---|---|
+| **CLI** | DuckDB | Local files | Development, assessment requirement |
+| **Lambda** | DuckDB | < 3 GB | Event-driven S3 processing, zero idle cost |
+| **Spark EMR** | Spark SQL | 3 GB – 100+ GB | Production scale for large data feeds |
+
+The same attribution SQL runs on both DuckDB and Spark SQL without modification.
+
+## Project Structure
+
+```
+src/
+  main.py                     # CLI entry point (accepts single TSV file argument)
+  common/
+    analyzer.py               # Core attribution engine (SessionAwareAnalyzer)
+    url_parser.py             # URL/keyword parsing (pure stdlib, Spark UDF-safe)
+    config.py                 # TOML config loader
+    search_engines.toml       # Search engine domains + keyword param config
+    sql/attribution.sql       # Shared attribution SQL (DuckDB + Spark SQL)
+  lambda/
+    handler.py                # AWS Lambda S3-triggered entry point
+  emr/
+    spark_job.py              # EMR Serverless Spark job
+tests/                        # 57 pytest tests
+terraform/                    # IaC for S3 buckets, Lambda, IAM roles
+scripts/
+  package_lambda.sh           # Lambda deployment packaging
+docs/
+  HLD.md                      # High-Level Design (13 sections)
+  design_evolution.md         # Design timeline and decision log
+```
+
+## Quick Start (CLI)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run attribution on sample data
+python src/main.py "requirements/data[98].sql"
+
+# Output: YYYY-mm-dd_SearchKeywordPerformance.tab
+```
+
+Expected output for the sample data:
+
+| Search Engine Domain | Search Keyword | Revenue |
+|---|---|---|
+| google.com | ipod | 480.00 |
+| bing.com | zune | 250.00 |
+
+## AWS Deployment (Lambda)
+
+```bash
+# 1. Package Lambda zip (~20 MB with DuckDB)
+chmod +x scripts/package_lambda.sh
+./scripts/package_lambda.sh
+
+# 2. Deploy infrastructure
+cd terraform
+terraform init
+terraform apply
+
+# 3. Test: upload a TSV to the input S3 bucket
+aws s3 cp "requirements/data[98].sql" s3://<input-bucket>/data.tsv
+```
+
+The Lambda triggers automatically on S3 upload and writes results to the output bucket.
+
+## Running Tests
+
+```bash
+pytest              # 57 tests across 6 test modules
+pytest -v           # verbose output
+```
+
+Test coverage includes: URL parsing edge cases, config loading, session attribution logic, Lambda handler (mocked S3), and CLI subprocess tests.
+
+## Scalability
+
+- **Lambda + DuckDB** handles files up to ~3 GB (DuckDB needs 2-3x file size in RAM; Lambda max is 10 GB)
+- **Spark EMR Serverless** handles 10 GB+ files with distributed processing
+- Session timeout, search engine domains, and keyword params are all configurable via `search_engines.toml`
+
+See [docs/HLD.md](docs/HLD.md) for detailed scalability analysis and architectural decisions.
+
+## Documentation
+
+- [High-Level Design](docs/HLD.md) — business problem, data story, attribution algorithm, AWS infrastructure, scalability
+- [Design Evolution](docs/design_evolution.md) — timeline of design iterations, challenged assumptions, and evidence-based pivots

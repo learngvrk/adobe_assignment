@@ -1,8 +1,7 @@
 """
 url_parser
 ----------
-Pure stateless functions for parsing search engine referrer URLs.
-No class needed — same input always produces same output.
+Functions for parsing search engine referrer URLs.
 
 Designed to be registered directly as Spark UDFs without modification:
 
