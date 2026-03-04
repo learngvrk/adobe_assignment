@@ -98,6 +98,25 @@ Rewrote the analyzer with a **two-phase pipeline**:
 
 **Result**: Lambda zip dropped from **46 MB (Polars) to 20 MB (DuckDB)**. All 57 tests pass. Same output: google.com/ipod/$480, bing.com/zune/$250.
 
+### Phase 12: EMR Serverless Deployment & Operational Learnings — Mar 4
+
+Deployed the Spark job to EMR Serverless and encountered seven distinct issues that revealed fundamental differences between EMR Serverless and EMR on EC2.
+
+**Capacity tuning — Spark defaults vs. Serverless ceilings:**
+EMR Serverless enforces a hard `maximum_capacity` ceiling. Spark's defaults (4 cores + 14 GB per executor, dynamic allocation requesting 3 executors) demanded ~42 GB for executors alone — far exceeding any reasonable ceiling for a demo workload. Fixed by explicitly setting `spark.executor.cores=1`, `spark.executor.memory=2g`, `spark.executor.instances=1`, and `spark.dynamicAllocation.enabled=false` in the submit script. Removed `initial_capacity` (pre-warmed resources) since on-demand allocation is sufficient for assessment-scale jobs.
+
+**`--py-files` zip behavior:**
+EMR Serverless keeps `--py-files` zip archives on `sys.path` *without extracting them to disk*. `Path(__file__).parent` resolves to a temp directory, not the zip contents. Standard file I/O fails. Fixed with `pkgutil.get_data("common", "sql/attribution.sql")`, which reads files from inside zip archives. On EMR on EC2, YARN extracts zips to the working directory — this issue wouldn't occur.
+
+**SQL dialect adaptation:**
+The shared `attribution.sql` uses DuckDB-compatible double-quoted aliases (`AS "Revenue"`). Spark SQL requires backticks (`` AS `Revenue` ``). Added a regex replacement at runtime rather than maintaining two SQL files — keeps the single-SQL-file architecture intact.
+
+**IAM least-privilege for Spark on S3:**
+Spark's write path checks if the output directory exists before writing (`s3:ListBucket` on the output bucket) and uses `s3:DeleteObject` for overwrite mode. Both permissions were missing from the initial IAM policy.
+
+**Key takeaway — EMR Serverless vs. EMR on EC2 for production:**
+EMR Serverless is ideal for this assessment demo (zero idle cost, no cluster management, quick setup). However, for Adobe-scale production workloads with hundreds of concurrent jobs, **EMR on EC2** is the better choice: persistent YARN clusters with pre-provisioned capacity, shared resource pools across jobs, reserved instance pricing, extracted zip files on local disk, and no per-job capacity ceilings. The Terraform and Spark code would require only minor adjustments (cluster config replaces application config, YARN handles resource allocation).
+
 ---
 
 ## Key Assertions Challenged
@@ -116,8 +135,8 @@ Throughout the project, several assumptions were tested and either validated or 
 ### 4. "Threading can scale Lambda to 10 GB"
 **Researched and disproven.** Session attribution requires a global sort across all hits per visitor — inherently sequential. Python's GIL blocks CPU parallelism. `multiprocessing.Pool` fails in Lambda's sandboxed environment (no `/dev/shm`). DuckDB uses its own internal threads, but the workload is memory-bound, not CPU-bound.
 
-### 5. "We need a middle tier (ECS Fargate)"
-**Evaluated and deferred.** ECS Fargate + DuckDB (30 GB RAM, 200 GB disk, no timeout) could handle 10 GB files. But for an Adobe-scale platform serving hundreds of clients, Spark is the natural choice — it's what Adobe already uses in production. The middle tier adds complexity without clear benefit for this use case.
+### 5. "AWS Glue could replace Lambda"
+**Evaluated and deferred.** Glue is a valid serverless alternative — it runs managed Spark, handles any file size, and supports S3 event triggers via EventBridge. However, Lambda was chosen for the primary submission because: (1) instant cold start for the live code review demo (~1-2s vs Glue's 1-3min), (2) free tier availability (1M invocations/month vs no Glue free tier), (3) per-ms billing is more cost-effective for small files than Glue's 1 DPU-minute minimum. Critically, Glue runs Spark — the same engine as the EMR scale-out tier — so adding Glue would be redundant, not additive. The architecture benefits from heterogeneous tiers: DuckDB for speed on small files, Spark for scale on large files.
 
 ---
 

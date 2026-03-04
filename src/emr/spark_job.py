@@ -21,8 +21,9 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf
 from pyspark.sql.types import BooleanType, DoubleType, StringType
 
-# The shared SQL lives alongside common/
-_SQL_PATH = Path(__file__).parent.parent / "common" / "sql" / "attribution.sql"
+# Resolve the shared SQL file.
+# Locally: relative to this file.  On EMR: inside the common package from --py-files.
+_LOCAL_SQL = Path(__file__).parent.parent / "common" / "sql" / "attribution.sql"
 
 # Default config values (same as search_engines.toml)
 SEARCH_ENGINE_DOMAINS = ["google", "bing", "yahoo", "duckduckgo", "msn", "ask", "aol"]
@@ -66,7 +67,22 @@ def main():
         # --- Phase 2: Run shared attribution SQL ---
         enriched.createOrReplaceTempView("hits")
 
-        attribution_sql = _SQL_PATH.read_text()
+        # Find attribution.sql: try local path first, fall back to pkgutil
+        # (--py-files keeps common.zip as a zip on sys.path, so Path won't work)
+        if _LOCAL_SQL.exists():
+            attribution_sql = _LOCAL_SQL.read_text()
+        else:
+            import pkgutil
+            data = pkgutil.get_data("common", "sql/attribution.sql")
+            attribution_sql = data.decode("utf-8")
+
+        # Adapt DuckDB-compatible SQL for Spark SQL:
+        # - Replace double-quoted aliases with backticks (Spark syntax)
+        import re
+        attribution_sql = re.sub(r' AS "([^"]+)"', r" AS `\1`", attribution_sql)
+        # - Fix ORDER BY to use backtick-quoted alias
+        attribution_sql = attribution_sql.replace('ORDER BY "Revenue"', "ORDER BY `Revenue`")
+
         result = spark.sql(attribution_sql)
 
         # --- Phase 3: Write output ---

@@ -1,4 +1,4 @@
-# Root Terraform configuration — wires S3 and Lambda modules together.
+# Root Terraform configuration — wires S3, Lambda, and EMR modules together.
 #
 # Usage:
 #   cd terraform/
@@ -47,4 +47,16 @@ module "lambda" {
   input_bucket_arn   = module.s3.input_bucket_arn
   output_bucket_name = module.s3.output_bucket_name
   output_bucket_arn  = module.s3.output_bucket_arn
+}
+
+# ------------------------------------------------------------------
+# EMR Serverless module — Spark application for large files (> 3 GB)
+# ------------------------------------------------------------------
+
+module "emr" {
+  source = "./modules/emr"
+
+  application_name  = "${var.project_prefix}-spark"
+  input_bucket_arn  = module.s3.input_bucket_arn
+  output_bucket_arn = module.s3.output_bucket_arn
 }
