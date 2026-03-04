@@ -20,6 +20,8 @@ Three-tier design with a shared SQL attribution query (`sql/attribution.sql`) ac
 
 The same attribution SQL runs on both DuckDB and Spark SQL without modification.
 
+AWS Glue was evaluated as an alternative to Lambda but deferred due to cold start latency (1-3min vs 1-2s) and lack of free tier — see [HLD](docs/HLD.md) for the full analysis.
+
 ## Project Structure
 
 ```
@@ -36,9 +38,11 @@ src/
   emr/
     spark_job.py              # EMR Serverless Spark job
 tests/                        # 57 pytest tests
-terraform/                    # IaC for S3 buckets, Lambda, IAM roles
+terraform/                    # IaC for S3 buckets, Lambda, EMR Serverless, IAM roles
 scripts/
   package_lambda.sh           # Lambda deployment packaging
+  package_emr.sh              # EMR Spark code packaging + S3 upload
+  submit_emr_job.sh           # Submit Spark job to EMR Serverless
 docs/
   HLD.md                      # High-Level Design (13 sections)
   design_evolution.md         # Design timeline and decision log
@@ -80,6 +84,28 @@ aws s3 cp "requirements/data[98].sql" s3://<input-bucket>/data.tsv
 ```
 
 The Lambda triggers automatically on S3 upload and writes results to the output bucket.
+
+## AWS Deployment (EMR Serverless — Spark)
+
+EMR Serverless is included for the assessment demo. In production, EMR on EC2 clusters would handle Adobe-scale workloads (hundreds of concurrent jobs, reserved instance pricing).
+
+```bash
+# 1. Deploy infrastructure (included in terraform apply above)
+# The EMR Serverless application is created alongside Lambda.
+
+# 2. Package and upload Spark code to S3
+chmod +x scripts/package_emr.sh
+./scripts/package_emr.sh <input-bucket>
+
+# 3. Submit a Spark job
+chmod +x scripts/submit_emr_job.sh
+./scripts/submit_emr_job.sh <app-id> <role-arn> <input-bucket> <output-bucket>
+
+# Get app-id and role-arn from: cd terraform && terraform output
+
+# 4. Check output
+aws s3 ls s3://<output-bucket>/emr-output/
+```
 
 ## Running Tests
 

@@ -227,7 +227,7 @@ The 30-minute inactivity timeout is the **industry standard** used by both Googl
 | 3 | **Config format** | TOML + `tomllib` | YAML + PyYAML, JSON, hardcoded dict | `tomllib` is Python 3.11+ stdlib — zero external dependencies. TOML is human-readable and supports comments. YAML requires PyYAML (extra dep). |
 | 4 | **Session timeout** | 30 minutes | 15 min, 60 min, `visit_num` column | Industry standard matching both Google Analytics and Adobe Analytics defaults. `visit_num` was not available in this dataset. |
 | 5 | **Infrastructure** | Terraform | CloudFormation, SAM, CDK | Cloud-agnostic HCL, modular structure, readable plans. SAM is AWS-specific and YAML-heavy. |
-| 6 | **Deployment model** | Lambda + S3 trigger | ECS Fargate, Step Functions | Simplest serverless pattern for event-driven file processing. Zero idle cost. Auto-scales. |
+| 6 | **Deployment model** | Lambda + S3 trigger | AWS Glue, Step Functions | Lambda offers instant cold start (~1-2s vs Glue's 1-3min), free tier (1M invocations/month vs no Glue free tier), and per-ms billing ideal for small files. Glue runs Spark — same engine as the EMR scale-out tier, making it redundant rather than additive. |
 | 7 | **S3 layout** | Two separate buckets | Single bucket with prefixes | Least-privilege IAM (Lambda reads input only, writes output only). Prevents accidental trigger loops. |
 | 8 | **URL parser design** | Pure stateless functions | Class with methods, regex patterns | Stateless functions register directly as Spark UDFs with zero modification. Regex is fragile for URL parsing — `urllib.parse` handles edge cases. |
 | 9 | **Test framework** | pytest | unittest | pytest: less boilerplate, better fixtures, cleaner assertions, industry standard. |
@@ -415,10 +415,26 @@ The system is designed with two processing tiers, selected based on file size, p
 | Tier | Engine | File Size | Use Case | Cost Model |
 |---|---|---|---|---|
 | **Lambda + DuckDB** | DuckDB in-memory | < 3 GB | Real-time event-driven processing | Pay-per-invocation, zero idle |
-| **Spark EMR Serverless** | Spark SQL | 3 GB — 100+ GB | Production at scale (Adobe processes hundreds of clients) | Pay-per-second, auto-scales |
+| **Spark EMR Serverless** | Spark SQL | 3 GB — 100+ GB | Assessment demo (production would use EMR on EC2) | Pay-per-second, auto-scales |
 | **CLI + DuckDB** | DuckDB in-memory | Local files | Development, testing, assessment requirement #3 | Free |
 
 **Key design principle**: All three tiers share the same `attribution.sql` query and `url_parser.py` functions. The SQL is portable — DuckDB SQL and Spark SQL both support the same window functions and CTEs used in the attribution logic.
+
+**EMR Serverless vs EMR on EC2:** EMR Serverless is used for the assessment to demonstrate the Spark tier without maintaining a permanent cluster. In production at Adobe scale (hundreds of clients, concurrent jobs, large data volumes), EMR on EC2 clusters would be preferred — persistent clusters avoid cold starts, support shared YARN resource pools, and benefit from reserved instance pricing.
+
+### EMR Serverless Infrastructure
+
+Deployed via `terraform/modules/emr/`:
+
+- **Application**: EMR Serverless Spark (emr-7.0.0), no pre-warmed capacity — resources allocated on-demand per job
+- **Maximum capacity**: 8 vCPU / 32 GB (enough for 1 driver + 1 executor for the assessment demo)
+- **IAM role permissions**:
+  - `s3:GetObject` on input bucket (data + scripts)
+  - `s3:ListBucket` on both input and output buckets (Spark reads/writes directories)
+  - `s3:PutObject` + `s3:DeleteObject` on output bucket (write results, overwrite mode)
+  - CloudWatch logs for driver/executor monitoring
+- **Job submission**: `scripts/submit_emr_job.sh` with Spark configs for minimal resource usage (`1 executor, 1 core, 2 GB memory`)
+- **Code packaging**: `scripts/package_emr.sh` uploads `spark_job.py` + `common.zip` to `s3://<input-bucket>/scripts/`
 
 ### Lambda Architecture Detail
 
@@ -585,15 +601,43 @@ Then the same attribution SQL runs via `spark.sql(attribution_sql)`.
 | **S3 Select** | Push filtering to S3 — only read rows with external referrers |
 | **Compression** | Accept gzipped TSV — reduces I/O time significantly |
 
+### Alternative Considered: AWS Glue
+
+AWS Glue is AWS's managed ETL service — it runs Spark under the hood but handles cluster provisioning, scaling, and teardown automatically. It qualifies as serverless (no infrastructure to manage) and supports S3 event triggers via EventBridge.
+
+**Glue was evaluated as an alternative to Lambda** for this pipeline. Here's the comparison:
+
+| Dimension | Lambda + DuckDB | AWS Glue |
+|---|---|---|
+| **Engine** | DuckDB (single-node SQL) | Spark (managed, distributed) |
+| **Cold start** | ~1-2 seconds | ~1-3 minutes |
+| **File size cap** | ~3 GB (RAM-bound) | No practical limit (distributed) |
+| **Billing** | Per-ms, pay only for execution time | Per DPU-second, minimum 1 minute |
+| **Free tier** | 1M invocations/month | No free tier (~$0.44/DPU-min) |
+| **Live demo** | Instant trigger on S3 upload | 1-3 min wait for Spark cold start |
+
+**Why Lambda was chosen over Glue:**
+
+1. **Cold start matters for the demo.** The 60-minute code review includes executing the code and reviewing results. Uploading a file to S3 and seeing Lambda trigger instantly is a significantly better demo than waiting 1-3 minutes for Glue's Spark cluster to provision.
+
+2. **Free tier.** The assessment suggests using a free tier AWS account. Lambda's 1M free invocations/month costs nothing. Glue charges ~$0.44 per DPU-minute with no free tier.
+
+3. **Cost efficiency for small files.** The sample data is 22 rows. Even in production, many client data feeds are under 1 GB. Lambda's per-ms billing makes these near-free; Glue's 1-minute minimum billing makes every invocation cost the same regardless of file size.
+
+4. **Showing architectural trade-offs demonstrates more depth.** Explaining "Lambda works for <3 GB, here's why it breaks at 10 GB, here's how Spark EMR solves that" shows more engineering reasoning than "I used Glue which handles everything."
+
+**Why Glue is NOT a third tier:** Glue runs Spark SQL — the same engine as EMR Serverless. Adding Glue alongside EMR would be two Spark-based tiers solving the same problem. The architecture benefits from heterogeneous tiers (DuckDB for speed + Spark for scale), not two variations of the same engine.
+
+**When Glue would be the right choice:** If operational simplicity is the top priority and cold start latency is acceptable, Glue could replace both Lambda and EMR as a single processing tier. This trades latency and cost-efficiency for a simpler architecture with one engine, one deployment, and one monitoring surface.
+
 ---
 
 ## 13. Next Steps
 
 | Item | Priority | Description |
 |---|---|---|
-| **EMR Serverless Spark job** | High | `src/emr/spark_job.py` — reuses `attribution.sql` via Spark SQL, `url_parser.py` as UDFs, same TOML config |
+| ~~**EMR Serverless Spark job**~~ | ~~High~~ | **Done.** Terraform module deployed, Spark job tested end-to-end on EMR Serverless. |
 | **Tier routing** | High | S3 event → Step Functions: route to Lambda (< 3 GB) or EMR (> 3 GB) based on `ContentLength` |
-| **README** | Medium | Setup instructions, quickstart, architecture overview |
-| **.gitignore** | Low | Exclude `build/`, `__pycache__/`, `.terraform/`, `*.tfstate` |
+| **EMR on EC2 for production** | Medium | Replace EMR Serverless with persistent EMR on EC2 clusters for Adobe-scale workloads (hundreds of concurrent jobs, reserved instance pricing) |
 | **Monitoring** | Future | CloudWatch alarms for Lambda errors, EMR job metrics, S3 lifecycle policies |
 | **Data validation** | Future | Schema validation on input TSV before processing |
