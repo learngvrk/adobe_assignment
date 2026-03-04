@@ -31,12 +31,12 @@ def main():
     config = load_config()
     analyzer = SessionAwareAnalyzer(config)
 
-    tsv_content = input_path.read_text()
+    tsv_content = input_path.read_text(encoding="utf-8")
     results = analyzer.process(tsv_content)
 
     filename, tab_content = analyzer.to_tab_delimited(results)
     output_path = Path(filename)
-    output_path.write_text(tab_content)
+    output_path.write_text(tab_content, encoding="utf-8")
 
     print(f"Processed {len(results)} keyword group(s)")
     print(f"Output: {output_path}")
