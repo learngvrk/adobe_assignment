@@ -117,7 +117,7 @@ aws s3 ls s3://<output-bucket>/emr-output/
 ## Running Tests
 
 ```bash
-pytest              # 57 tests across 6 test modules
+pytest              # 59 tests across 6 test modules
 pytest -v           # verbose output
 ```
 
@@ -135,3 +135,13 @@ See [docs/HLD.md](docs/HLD.md) for detailed scalability analysis and architectur
 
 - [High-Level Design](docs/HLD.md) — business problem, data story, attribution algorithm, AWS infrastructure, scalability
 - [Design Evolution](docs/design_evolution.md) — timeline of design iterations, challenged assumptions, and evidence-based pivots
+
+## Next Steps
+
+| Item | Priority | Description |
+|---|---|---|
+| **Tier routing** | High | S3 event → Step Functions: route to Lambda (< 3 GB) or EMR (> 3 GB) based on `ContentLength` |
+| **Ad campaign join** | High | Join attribution output with ad campaign spend data to measure ROAS (return on ad spend) and cost-per-acquisition per keyword — answers "which campaigns are actually profitable?" |
+| **EMR on EC2 for production** | Medium | Replace EMR Serverless with persistent EMR on EC2 clusters for Adobe-scale workloads (hundreds of concurrent jobs, reserved instance pricing) |
+| **Monitoring** | Future | CloudWatch alarms for Lambda errors, EMR job metrics, S3 lifecycle policies |
+| **Data validation** | Future | Schema validation on input TSV before processing |
