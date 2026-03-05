@@ -1,150 +1,114 @@
-# Design Evolution: Search Keyword Revenue Attribution
+# Design Evolution
 
-A timeline of how the solution architecture evolved through iterative design, challenged assumptions, and evidence-based pivots.
+How the solution took shape — what I tried, what broke, and why I changed direction.
 
 ---
 
-## Timeline
-
-### Phase 1: Project Scaffolding — Mar 1
+## Mar 1 — Getting started
 `09fe6b9`
 
-Set up the initial folder structure and analyzed the sample data. Identified 12 columns in the hit-level TSV, 22 rows from 4 unique visitors. Key insight: the `referrer` column on the first hit of a session contains the external search engine URL, while `page_url` always points to the client's site.
+Set up the folder structure and dug into the sample data. 12 columns in the hit-level TSV, 22 rows, 4 unique visitors. The key thing I noticed: `referrer` on the first hit of a session has the search engine URL, but `page_url` always points to the client's site (esshopzilla.com). That distinction ended up being important later.
 
-### Phase 2: First Implementation (Polars) — Mar 2
+## Mar 2 — First attempt with Polars
 `df26f16`
 
-Built the core pipeline: `url_parser.py` (pure stdlib functions), `config.py` (TOML loader), and `analyzer.py` using **Polars DataFrames** for session-aware attribution.
+Built the core pipeline: `url_parser.py` for extracting domains and keywords (pure stdlib), `config.py` for TOML loading, and `analyzer.py` using Polars DataFrames.
 
-**Critical discovery**: Row-level attribution produces **zero results**. Every purchase row has an internal checkout referrer (`esshopzilla.com/checkout/?a=confirm`), not a search engine URL. The search engine referrer only appears on the session entry hit, 5–8 pages before the purchase.
+Ran it and got... zero results. Turns out every purchase row has an internal checkout referrer (`esshopzilla.com/checkout/?a=confirm`), not a search engine URL. The search engine referrer only shows up on the session entry hit — 5 to 8 pages before the purchase. Row-level attribution simply doesn't work for this data.
 
-**Pivot**: Designed session-aware first-touch attribution — carry the entry referrer forward across the entire session.
+So I redesigned it around session-aware first-touch attribution: grab the search engine referrer from the session entry, carry it forward through the whole session, and attribute revenue at the session level.
 
-### Phase 3: Polars → Pandas → Polars — Mar 2
+## Mar 2 — Quick Polars vs Pandas detour
 `0c8f2ac`
 
-Briefly switched to pandas for wider familiarity, then realized Polars was more maintainable for the window operations needed (sort, lag, cumulative sum within partitions). Reverted to Polars.
+Briefly switched to pandas thinking it might be simpler. Realized Polars was actually cleaner for the window operations I needed (sort, lag, cumulative sum within partitions). Switched back.
 
-### Phase 4: Testing & CLI — Mar 2–3
+## Mar 2–3 — Tests and CLI
 `b431a08`, `7cb4fde`
 
-Added 53 pytest tests (later expanded to 57) covering URL parsing edge cases, config loading, session attribution logic, and Lambda handler with mocked S3. Created `main.py` CLI entry point to satisfy assessment requirement #3 ("accept a single argument").
+Wrote 53 pytest tests covering URL parsing edge cases, config loading, session attribution, and the Lambda handler with mocked S3. Built `main.py` as the CLI entry point — the assessment requires the app to "accept a single argument, which is the file."
 
-### Phase 5: CI/CD Pipeline — Mar 3
+## Mar 3 — CI/CD surprises
 `fadbdd9` → `357b23b`
 
-Set up GitHub Actions on a separate branch. Hit two real-world issues:
+Set up GitHub Actions. Two things bit me:
 
-1. **`lambda` is a Python keyword** — `from lambda.handler import handler` is a SyntaxError. Fixed with `importlib.util.spec_from_file_location`.
-2. **GitHub PAT missing `workflow` scope** — push was rejected for `.github/workflows/ci.yml`. Fixed by updating the token.
+1. `lambda` is a Python keyword — `from lambda.handler import handler` is a SyntaxError. Had to use `importlib.util.spec_from_file_location` instead.
+2. My GitHub PAT was missing the `workflow` scope, so pushing `.github/workflows/ci.yml` got rejected.
 
-These are the kind of integration issues you only find by actually deploying CI, not by running locally.
+Classic integration issues you only hit when you actually wire up CI.
 
-### Phase 6: Lambda Deployment + Terraform — Mar 2–3
+## Mar 2–3 — Lambda + Terraform
 
-Built Terraform modules for S3 (input/output buckets) and Lambda (function, IAM role, S3 trigger).
+Built Terraform modules for S3 buckets and the Lambda function (IAM role, permissions).
 
-**Issue**: Lambda failed with "Polars binary is missing!" The `package_lambda.sh` script used `--no-deps`, which excluded the native Rust binary. Removed the flag — zip grew from **2.2 MB to 46 MB**, confirming the binary was now included. Lambda worked after redeployment.
+First deploy failed: "Polars binary is missing!" My `package_lambda.sh` used `--no-deps` which excluded the native Rust binary. Removed the flag and the zip jumped from 2.2 MB to 46 MB — confirming the binary was now in there. Lambda worked after that.
 
-### Phase 7: High-Level Design Document — Mar 3
+## Mar 3 — Writing the HLD
 `4a9f744`
 
-Wrote a comprehensive 13-section HLD covering the business problem, data story (tracing all 4 visitors), why row-level fails, session attribution algorithm, decision log, AWS infrastructure, and scalability analysis.
+Wrote a 13-section high-level design doc. Sounds tedious but it forced me to think through the whole architecture properly — the data story, why row-level fails, the attribution algorithm, AWS infrastructure choices. Writing it down exposed gaps I hadn't thought about.
 
-### Phase 8: The DuckDB Challenge — Mar 3
+## Mar 3 — The DuckDB question
 
-After writing the HLD, questioned: **"Is DuckDB a better bet than Polars for a shared SQL layer between Lambda and Spark EMR?"**
+After the HLD, I asked myself: is DuckDB a better fit than Polars for sharing logic between Lambda and Spark?
 
-Initially defended Polars. The argument was that DuckDB adds an "unnecessary SQL layer." But when challenged on *where exactly* the constraint was:
+My first instinct was no — "DuckDB adds an unnecessary SQL layer." But then I thought about it more carefully:
 
-- **"Too heavy for serverless"** → Both Polars (46 MB) and DuckDB (~20 MB) are well within Lambda's 250 MB limit. This argument didn't hold.
-- **The real differentiator**: Polars API doesn't translate to PySpark. If we need both Lambda and Spark tiers, Polars requires **two separate codebases**. DuckDB SQL is portable — the same query runs on both DuckDB and Spark SQL.
+- The "too heavy for serverless" argument didn't hold up. Polars is 46 MB, DuckDB is ~20 MB. Both fit in Lambda's 250 MB limit easily.
+- The real problem: Polars API doesn't translate to PySpark at all. If I want both a Lambda tier and a Spark tier, Polars means maintaining two completely separate codebases. DuckDB SQL is portable — same query runs on both DuckDB and Spark SQL.
 
-**Decision**: Switch to DuckDB.
+That settled it. Switched to DuckDB.
 
-### Phase 9: Deep Research Before Switching — Mar 3
+## Mar 3 — Research before building
 
-Before committing to the switch, conducted deep technical research on three questions:
+Before committing to the switch, I researched three things:
 
-| Question | Finding |
-|---|---|
-| **Can Lambda handle 10 GB files?** | No. Lambda has 10 GB max memory; DuckDB needs 2–3x file size in RAM. Realistic cap: ~3 GB. |
-| **Is EMR Serverless truly serverless?** | "Serverless-ish" — no cluster management, pay-per-second, but 10s–3min cold starts. |
-| **Can threading scale Lambda to 10 GB?** | No. Session attribution requires a global sort (inherently sequential). Python's GIL blocks CPU parallelism. `multiprocessing.Pool` fails in Lambda (no `/dev/shm`). |
+- **Can Lambda handle 10 GB files?** No. Lambda maxes out at 10 GB RAM, but DuckDB needs 2–3x file size for sorting and window functions. Realistic cap is ~3 GB.
+- **Is EMR Serverless actually serverless?** Sort of. No cluster management, pay-per-second, but 10s–3min cold starts. "Serverless-ish."
+- **Can threading scale Lambda to 10 GB?** No. Session attribution needs a global sort — inherently sequential. Python's GIL blocks CPU parallelism, and `multiprocessing.Pool` fails in Lambda (no `/dev/shm`).
 
-This research prevented wasted effort — without it, we might have built a threading solution that fundamentally can't work for this workload.
+This saved me from building a threading solution that fundamentally can't work for this workload.
 
-### Phase 10: Three-Tier Architecture — Mar 3
+## Mar 3 — Three-tier design
 
-Designed the architecture with two processing tiers plus CLI:
+Landed on three tiers:
 
-| Tier | Engine | File Size | Rationale |
+| Tier | Engine | File Size | Why |
 |---|---|---|---|
-| **Lambda + DuckDB** | DuckDB in-memory | < 3 GB | Event-driven, zero idle cost |
-| **Spark EMR Serverless** | Spark SQL | 3 GB – 100+ GB | Adobe serves hundreds of clients — Spark at scale |
-| **CLI + DuckDB** | DuckDB in-memory | Local files | Development + assessment requirement |
+| CLI + DuckDB | DuckDB | Local files | Dev + assessment requirement |
+| Lambda + DuckDB | DuckDB | < 3 GB | On-demand, zero idle cost |
+| Spark EMR | Spark SQL | 3 GB – 100+ GB | Adobe serves hundreds of clients — this is where Spark makes sense |
 
-Key insight from the user: *"This is just sample data for one client. Adobe serves hundreds of clients — Spark makes sense at production scale."*
+The same `attribution.sql` runs on all tiers without modification.
 
-### Phase 11: Polars → DuckDB Switch — Mar 3
+## Mar 3 — The actual switch to DuckDB
 `6c5c037`
 
-Rewrote the analyzer with a **two-phase pipeline**:
+Rewrote the analyzer as a two-phase pipeline:
 
-1. **Python enrichment**: Pre-compute `_domain`, `_keyword`, `_is_purchase`, `_revenue` columns using Python's `csv` module
-2. **DuckDB SQL**: Execute `attribution.sql` on the enriched data — pure SQL, no UDFs
+1. **Python enrichment** — pre-compute `_domain`, `_keyword`, `_is_purchase`, `_revenue` columns using Python's `csv` module
+2. **DuckDB SQL** — execute `attribution.sql` on the enriched data
 
-**Why two phases?** DuckDB's `create_function()` requires numpy for Python UDF registration. Instead of adding a ~25 MB dependency, we pre-compute in Python and keep the SQL truly UDF-free and portable.
+Why two phases? DuckDB's `create_function()` needs numpy for Python UDF registration. Instead of adding a ~25 MB dependency, I pre-compute in Python and keep the SQL UDF-free and portable.
 
-**Result**: Lambda zip dropped from **46 MB (Polars) to 20 MB (DuckDB)**. All 57 tests pass. Same output: google.com/ipod/$480, bing.com/zune/$250.
+Result: Lambda zip dropped from 46 MB (Polars) to 20 MB (DuckDB). All tests pass. Same output: google.com/ipod/$480, bing.com/zune/$250.
 
-### Phase 12: EMR Serverless Deployment & Operational Learnings — Mar 4
+## Mar 4 — EMR Serverless deployment
+`feat/ci-cd-pipeline`
 
-Deployed the Spark job to EMR Serverless and encountered seven distinct issues that revealed fundamental differences between EMR Serverless and EMR on EC2.
+Deployed to EMR Serverless and hit a bunch of issues that only surface when you actually run on the real infrastructure:
 
-**Capacity tuning — Spark defaults vs. Serverless ceilings:**
-EMR Serverless enforces a hard `maximum_capacity` ceiling. Spark's defaults (4 cores + 14 GB per executor, dynamic allocation requesting 3 executors) demanded ~42 GB for executors alone — far exceeding any reasonable ceiling for a demo workload. Fixed by explicitly setting `spark.executor.cores=1`, `spark.executor.memory=2g`, `spark.executor.instances=1`, and `spark.dynamicAllocation.enabled=false` in the submit script. Removed `initial_capacity` (pre-warmed resources) since on-demand allocation is sufficient for assessment-scale jobs.
+**Capacity tuning** — Spark's defaults (4 cores, 14 GB per executor, dynamic allocation requesting 3 executors) demanded ~42 GB. Way too much for a demo workload. Had to explicitly set `executor.cores=1`, `executor.memory=2g`, `executor.instances=1` and disable dynamic allocation.
 
-**`--py-files` zip behavior:**
-EMR Serverless keeps `--py-files` zip archives on `sys.path` *without extracting them to disk*. `Path(__file__).parent` resolves to a temp directory, not the zip contents. Standard file I/O fails. Fixed with `pkgutil.get_data("common", "sql/attribution.sql")`, which reads files from inside zip archives. On EMR on EC2, YARN extracts zips to the working directory — this issue wouldn't occur.
+**Zip files don't get extracted** — EMR Serverless keeps `--py-files` zips on `sys.path` without extracting to disk. So `Path(__file__).parent` points to a temp dir, not the zip contents. Fixed with `pkgutil.get_data()` which reads from inside zips. On EMR on EC2 with YARN, this wouldn't be an issue since YARN extracts zips to the working directory.
 
-**SQL dialect adaptation:**
-The shared `attribution.sql` uses DuckDB-compatible double-quoted aliases (`AS "Revenue"`). Spark SQL requires backticks (`` AS `Revenue` ``). Added a regex replacement at runtime rather than maintaining two SQL files — keeps the single-SQL-file architecture intact.
+**SQL dialect mismatch** — The shared `attribution.sql` uses DuckDB-style double-quoted aliases (`AS "Revenue"`). Spark SQL wants backticks. Added a regex replacement at runtime instead of maintaining two SQL files.
 
-**IAM least-privilege for Spark on S3:**
-Spark's write path checks if the output directory exists before writing (`s3:ListBucket` on the output bucket) and uses `s3:DeleteObject` for overwrite mode. Both permissions were missing from the initial IAM policy.
+**Missing IAM permissions** — Spark checks if the output directory exists before writing (`s3:ListBucket`) and needs `s3:DeleteObject` for overwrite mode. Both were missing initially.
 
-**Key takeaway — EMR Serverless vs. EMR on EC2 for production:**
-EMR Serverless is ideal for this assessment demo (zero idle cost, no cluster management, quick setup). However, for Adobe-scale production workloads with hundreds of concurrent jobs, **EMR on EC2** is the better choice: persistent YARN clusters with pre-provisioned capacity, shared resource pools across jobs, reserved instance pricing, extracted zip files on local disk, and no per-job capacity ceilings. The Terraform and Spark code would require only minor adjustments (cluster config replaces application config, YARN handles resource allocation).
+**Bottom line on EMR Serverless vs EC2**: Serverless is great for this demo (zero idle cost, no cluster management). But for Adobe-scale production with hundreds of concurrent jobs, EMR on EC2 makes more sense — persistent clusters, shared resource pools, reserved pricing, and none of the zip/capacity quirks.
 
----
+## Mar 4–5 — Lambda direct invocation fix
 
-## Key Assertions Challenged
-
-Throughout the project, several assumptions were tested and either validated or disproven:
-
-### 1. "Row-level attribution works"
-**Disproven.** Every purchase row has an internal checkout referrer. The search engine referrer only appears on the session entry hit. Row-level attribution produces zero results on this dataset.
-
-### 2. "Polars is too heavy for serverless"
-**Challenged.** Both Polars (46 MB) and DuckDB (20 MB) fit comfortably within Lambda's 250 MB deployment limit. The "too heavy" argument was imprecise — the real constraint is SQL portability, not package size.
-
-### 3. "Lambda can handle 10 GB files"
-**Researched and disproven.** Lambda allows 10 GB memory, but DuckDB needs 2–3x file size in RAM for sorting, window functions, and joins. A 10 GB file would need ~20–30 GB RAM. Realistic Lambda cap: ~3 GB.
-
-### 4. "Threading can scale Lambda to 10 GB"
-**Researched and disproven.** Session attribution requires a global sort across all hits per visitor — inherently sequential. Python's GIL blocks CPU parallelism. `multiprocessing.Pool` fails in Lambda's sandboxed environment (no `/dev/shm`). DuckDB uses its own internal threads, but the workload is memory-bound, not CPU-bound.
-
-### 5. "AWS Glue could replace Lambda"
-**Evaluated and deferred.** Glue is a valid serverless alternative — it runs managed Spark, handles any file size, and supports S3 event triggers via EventBridge. However, Lambda was chosen for the primary submission because: (1) instant cold start for the live code review demo (~1-2s vs Glue's 1-3min), (2) free tier availability (1M invocations/month vs no Glue free tier), (3) per-ms billing is more cost-effective for small files than Glue's 1 DPU-minute minimum. Critically, Glue runs Spark — the same engine as the EMR scale-out tier — so adding Glue would be redundant, not additive. The architecture benefits from heterogeneous tiers: DuckDB for speed on small files, Spark for scale on large files.
-
----
-
-## What This Shows
-
-This evolution demonstrates:
-
-- **Evidence-based decision making** — not picking a tool and defending it, but testing assumptions with data
-- **Willingness to pivot** — three different DataFrame/SQL engines evaluated, switched when evidence supported it
-- **Research before building** — deep-dived Lambda constraints before committing to the DuckDB switch, preventing wasted work
-- **Practical architecture** — chose technologies that match the real production context (Adobe + Spark), not just the sample data
+Realized the Lambda was triggered by S3 events (auto-fires on upload), but the assessment says "accept a single argument, which is the file." Changed the handler to accept `{"file": "s3://bucket/key.tsv"}` via direct `aws lambda invoke`. Removed the S3 trigger from Terraform. Added validation tests. Both Lambda and EMR tested end-to-end on AWS — output matches expected results.
