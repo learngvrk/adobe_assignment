@@ -25,29 +25,20 @@ def sample_tsv():
 
 
 @pytest.fixture
-def s3_event():
-    return {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {"name": "test-input-bucket"},
-                    "object": {"key": "data/sample.tsv"},
-                }
-            }
-        ]
-    }
+def invoke_event():
+    return {"file": "s3://test-input-bucket/data/sample.tsv"}
 
 
 @patch.object(handler_module, "s3")
 @patch.object(handler_module, "OUTPUT_BUCKET", "test-output-bucket")
 @patch.object(handler_module, "OUTPUT_PREFIX", "results/")
-def test_handler_success(mock_s3, s3_event, sample_tsv):
+def test_handler_success(mock_s3, invoke_event, sample_tsv):
     """Handler reads TSV, processes it, and writes output to S3."""
     mock_body = MagicMock()
     mock_body.read.return_value = sample_tsv.encode("utf-8")
     mock_s3.get_object.return_value = {"Body": mock_body}
 
-    result = handler_module.handler(s3_event, None)
+    result = handler_module.handler(invoke_event, None)
 
     # Verify read from correct bucket/key
     mock_s3.get_object.assert_called_once_with(
@@ -70,13 +61,13 @@ def test_handler_success(mock_s3, s3_event, sample_tsv):
 @patch.object(handler_module, "s3")
 @patch.object(handler_module, "OUTPUT_BUCKET", "test-output-bucket")
 @patch.object(handler_module, "OUTPUT_PREFIX", "results/")
-def test_handler_output_content(mock_s3, s3_event, sample_tsv):
+def test_handler_output_content(mock_s3, invoke_event, sample_tsv):
     """Verify the actual content written to S3 contains expected data."""
     mock_body = MagicMock()
     mock_body.read.return_value = sample_tsv.encode("utf-8")
     mock_s3.get_object.return_value = {"Body": mock_body}
 
-    handler_module.handler(s3_event, None)
+    handler_module.handler(invoke_event, None)
 
     written_body = mock_s3.put_object.call_args[1]["Body"]
     content = written_body.decode("utf-8")
@@ -91,13 +82,27 @@ def test_handler_output_content(mock_s3, s3_event, sample_tsv):
 @patch.object(handler_module, "s3")
 @patch.object(handler_module, "OUTPUT_BUCKET", "")
 @patch.object(handler_module, "OUTPUT_PREFIX", "output/")
-def test_handler_fallback_to_input_bucket(mock_s3, s3_event, sample_tsv):
-    """When OUTPUT_BUCKET is empty, handler writes to input bucket."""
+def test_handler_fallback_to_input_bucket(mock_s3, invoke_event, sample_tsv):
+    """When OUTPUT_BUCKET is empty, handler writes to input file's bucket."""
     mock_body = MagicMock()
     mock_body.read.return_value = sample_tsv.encode("utf-8")
     mock_s3.get_object.return_value = {"Body": mock_body}
 
-    handler_module.handler(s3_event, None)
+    handler_module.handler(invoke_event, None)
 
     call_kwargs = mock_s3.put_object.call_args[1]
     assert call_kwargs["Bucket"] == "test-input-bucket"
+
+
+def test_handler_missing_file():
+    """Handler returns 400 when 'file' key is missing."""
+    result = handler_module.handler({}, None)
+    assert result["statusCode"] == 400
+    assert "file" in result["error"].lower()
+
+
+def test_handler_invalid_s3_uri():
+    """Handler returns 400 for invalid S3 URI."""
+    result = handler_module.handler({"file": "not-an-s3-uri"}, None)
+    assert result["statusCode"] == 400
+    assert "s3://" in result["error"]

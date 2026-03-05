@@ -15,7 +15,7 @@ Three-tier design with a shared SQL attribution query (`sql/attribution.sql`) ac
 | Tier | Engine | File Size | Use Case |
 |---|---|---|---|
 | **CLI** | DuckDB | Local files | Development, assessment requirement |
-| **Lambda** | DuckDB | < 3 GB | Event-driven S3 processing, zero idle cost |
+| **Lambda** | DuckDB | < 3 GB | On-demand S3 processing, zero idle cost |
 | **Spark EMR** | Spark SQL | 3 GB – 100+ GB | Production scale for large data feeds |
 
 The same attribution SQL runs on both DuckDB and Spark SQL without modification.
@@ -34,10 +34,10 @@ src/
     search_engines.toml       # Search engine domains + keyword param config
     sql/attribution.sql       # Shared attribution SQL (DuckDB + Spark SQL)
   lambda/
-    handler.py                # AWS Lambda S3-triggered entry point
+    handler.py                # AWS Lambda entry point (accepts S3 file path)
   emr/
     spark_job.py              # EMR Serverless Spark job
-tests/                        # 57 pytest tests
+tests/                        # 59 pytest tests
 terraform/                    # IaC for S3 buckets, Lambda, EMR Serverless, IAM roles
 scripts/
   package_lambda.sh           # Lambda deployment packaging
@@ -79,11 +79,18 @@ cd terraform
 terraform init
 terraform apply
 
-# 3. Test: upload a TSV to the input S3 bucket
+# 3. Upload a TSV file to S3
 aws s3 cp "requirements/data[98].sql" s3://<input-bucket>/data.tsv
+
+# 4. Invoke Lambda with the file to process (single argument)
+aws lambda invoke --function-name <function-name> \
+    --payload '{"file": "s3://<input-bucket>/data.tsv"}' \
+    --cli-binary-format raw-in-base64-out response.json
+
+# Get function-name from: cd terraform && terraform output
 ```
 
-The Lambda triggers automatically on S3 upload and writes results to the output bucket.
+The Lambda reads the file from S3, runs attribution, and writes the result to the output bucket.
 
 ## AWS Deployment (EMR Serverless — Spark)
 

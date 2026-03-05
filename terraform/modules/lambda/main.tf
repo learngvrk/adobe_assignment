@@ -84,27 +84,7 @@ resource "aws_lambda_function" "this" {
 }
 
 # ------------------------------------------------------------------
-# S3 Trigger — fires Lambda when a file lands in the input bucket
+# Invocation — Lambda is invoked directly via AWS CLI or SDK:
+#   aws lambda invoke --function-name <name> \
+#       --payload '{"file": "s3://bucket/data.tsv"}' response.json
 # ------------------------------------------------------------------
-
-# Permission: allow S3 to invoke this Lambda
-resource "aws_lambda_permission" "s3" {
-  statement_id  = "AllowS3Invocation"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.this.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = var.input_bucket_arn
-}
-
-# S3 event notification → Lambda
-resource "aws_s3_bucket_notification" "trigger" {
-  bucket = var.input_bucket_name
-
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.this.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_suffix       = ".tsv"
-  }
-
-  depends_on = [aws_lambda_permission.s3]
-}

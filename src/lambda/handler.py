@@ -1,21 +1,27 @@
 """
-Lambda handler — S3-triggered entry point for search keyword attribution.
+Lambda handler — entry point for search keyword attribution.
+
+Accepts a single argument: the S3 file to process.
+
+Invocation:
+    aws lambda invoke --function-name <name> \\
+        --payload '{"file": "s3://bucket/path/to/data.tsv"}' \\
+        --cli-binary-format raw-in-base64-out response.json
 
 Flow:
-    S3 ObjectCreated event
-    → reads TSV from input bucket
+    Payload with S3 file path
+    → reads TSV from S3
     → runs SessionAwareAnalyzer (session-aware first-touch attribution)
     → writes tab-delimited output to output bucket
 
 Environment variables:
-    OUTPUT_BUCKET : S3 bucket for result files (required)
+    OUTPUT_BUCKET : S3 bucket for result files (falls back to input file's bucket)
     OUTPUT_PREFIX : key prefix for output files (default: "output/")
     LOG_LEVEL     : logging level (default: "INFO")
 """
 
 import logging
 import os
-import urllib.parse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -36,30 +42,40 @@ OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET", "")
 OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "output/")
 
 
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Parse 's3://bucket/key' into (bucket, key)."""
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Expected s3:// URI, got: {uri}")
+    path = uri[5:]  # strip 's3://'
+    bucket, _, key = path.partition("/")
+    if not bucket or not key:
+        raise ValueError(f"Invalid S3 URI (need bucket and key): {uri}")
+    return bucket, key
+
+
 def handler(event, context):
     """
-    AWS Lambda entry point — triggered by S3 ObjectCreated.
+    AWS Lambda entry point — accepts a single file argument.
 
     Args:
-        event:   S3 event payload (contains bucket name and object key).
+        event:   Dict with "file" key containing the S3 URI to process.
+                 Example: {"file": "s3://my-bucket/data.tsv"}
         context: Lambda runtime context.
 
     Returns:
         Dict with statusCode and output file location.
     """
-    # Validate event structure
-    records = event.get("Records")
-    if not records:
-        logger.error("Invalid event: missing or empty 'Records'")
-        return {"statusCode": 400, "error": "Invalid S3 event: no Records"}
+    # Validate: the application accepts a single argument — the file
+    file_uri = event.get("file")
+    if not file_uri:
+        logger.error("Missing 'file' in event payload")
+        return {"statusCode": 400, "error": "Missing 'file' — expected {\"file\": \"s3://bucket/key.tsv\"}"}
 
-    record = records[0]
     try:
-        input_bucket = record["s3"]["bucket"]["name"]
-        input_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-    except (KeyError, TypeError) as exc:
-        logger.error("Malformed S3 event record: %s", exc)
-        return {"statusCode": 400, "error": f"Malformed S3 event: {exc}"}
+        input_bucket, input_key = _parse_s3_uri(file_uri)
+    except ValueError as exc:
+        logger.error("Invalid file argument: %s", exc)
+        return {"statusCode": 400, "error": str(exc)}
 
     logger.info("Processing s3://%s/%s", input_bucket, input_key)
 
