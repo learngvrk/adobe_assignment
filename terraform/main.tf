@@ -33,7 +33,7 @@ module "s3" {
 }
 
 # ------------------------------------------------------------------
-# Lambda module — function, IAM, S3 trigger
+# Lambda module — function + IAM (invoked directly via AWS CLI)
 # ------------------------------------------------------------------
 
 module "lambda" {
@@ -43,7 +43,6 @@ module "lambda" {
   deployment_package_path = var.deployment_package_path
   lambda_layer_arns       = var.lambda_layer_arns
 
-  input_bucket_name  = module.s3.input_bucket_name
   input_bucket_arn   = module.s3.input_bucket_arn
   output_bucket_name = module.s3.output_bucket_name
   output_bucket_arn  = module.s3.output_bucket_arn

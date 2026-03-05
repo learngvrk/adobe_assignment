@@ -14,11 +14,6 @@ variable "lambda_layer_arns" {
   default     = []
 }
 
-variable "input_bucket_name" {
-  description = "Name of the S3 input bucket (for trigger)"
-  type        = string
-}
-
 variable "input_bucket_arn" {
   description = "ARN of the S3 input bucket"
   type        = string
