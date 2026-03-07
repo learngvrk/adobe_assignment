@@ -4,10 +4,13 @@ import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from common.config import load_config
 
 import pytest
 
-SAMPLE_DATA = Path(__file__).parent.parent / "requirements" / "data[98].sql"
+config = load_config()
+
+SAMPLE_DATA = Path(__file__).parent.parent / config["Input_folder"] / "data[98].sql"
 HANDLER_PATH = Path(__file__).parent.parent / "src" / "lambda" / "handler.py"
 
 # 'lambda' is a Python reserved keyword — cannot use importlib.import_module().

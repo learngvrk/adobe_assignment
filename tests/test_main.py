@@ -3,12 +3,13 @@
 import subprocess
 import sys
 from pathlib import Path
-
+from common.config import load_config
 import pytest
 
+config = load_config()
 PROJECT_ROOT = Path(__file__).parent.parent
 MAIN_SCRIPT = PROJECT_ROOT / "src" / "main.py"
-SAMPLE_DATA = PROJECT_ROOT / "requirements" / "data[98].sql"
+SAMPLE_DATA = PROJECT_ROOT / config["Input_folder"] / "data[98].sql"
 
 
 def run_cli(*args):

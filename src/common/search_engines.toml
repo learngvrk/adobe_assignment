@@ -17,3 +17,6 @@ search_engine_domains = [
 
 # Tried in order — first match wins.
 keyword_params = ["q", "p", "query", "search"]
+
+# Path for Sample Input Data
+Input_folder = "Input_data"
