@@ -22,7 +22,7 @@ from common.config import load_config
 
 config = load_config()
 
-SAMPLE_DATA = Path(__file__).parent.parent / config["Input_folder"] / "data[98].sql"
+SAMPLE_DATA = Path(__file__).parent.parent / config.get("Input_folder", "Input_data") / config.get("data_file", "data.sql")
 
 EXPECTED = [
     {"Search Engine Domain": "google.com", "Search Keyword": "ipod",  "Revenue": 480.00},

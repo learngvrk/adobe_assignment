@@ -4,7 +4,7 @@ import tomllib
 from pathlib import Path
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "search_engines.toml"
-_REQUIRED_KEYS = ("search_engine_domains", "keyword_params", "Input_folder")
+_REQUIRED_KEYS = ("search_engine_domains", "keyword_params", "Input_folder", "data_file")
 
 
 def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> dict:

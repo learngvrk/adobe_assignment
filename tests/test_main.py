@@ -9,7 +9,7 @@ import pytest
 config = load_config()
 PROJECT_ROOT = Path(__file__).parent.parent
 MAIN_SCRIPT = PROJECT_ROOT / "src" / "main.py"
-SAMPLE_DATA = PROJECT_ROOT / config["Input_folder"] / "data[98].sql"
+SAMPLE_DATA = PROJECT_ROOT / config.get("Input_folder", "Input_data") / config.get("data_file", "data.sql")
 
 
 def run_cli(*args):

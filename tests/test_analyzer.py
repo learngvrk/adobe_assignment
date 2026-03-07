@@ -7,7 +7,10 @@ import pytest
 
 from common.analyzer import SessionAwareAnalyzer
 from conftest import make_tsv
+from common.config import load_config
 
+
+config = load_config()
 
 # ---------- Static helper tests ----------
 
@@ -61,7 +64,7 @@ class TestExtractRevenue:
 class TestProcess:
     def test_sample_data(self, analyzer):
         """Integration test against the real sample data file."""
-        sample = Path(__file__).parent.parent / "requirements" / "data[98].sql"
+        sample = Path(__file__).parent.parent / config.get("Input_folder", "Input_data") / config.get("data_file", "data.sql")
         with open(sample) as f:
             content = f.read()
 
