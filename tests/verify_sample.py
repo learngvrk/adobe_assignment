@@ -18,8 +18,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from common.config import load_config
 from common.analyzer import SessionAwareAnalyzer
+from common.config import load_config
 
-SAMPLE_DATA = Path(__file__).parent.parent / "requirements" / "data[98].sql"
+config = load_config()
+
+SAMPLE_DATA = Path(__file__).parent.parent / config.get("Input_folder", "Input_data") / config.get("data_file", "data.sql")
 
 EXPECTED = [
     {"Search Engine Domain": "google.com", "Search Keyword": "ipod",  "Revenue": 480.00},

@@ -33,5 +33,5 @@ jobs:
 
       - name: Run CLI smoke test
         run: |
-          python src/main.py "requirements/data[98].sql"
+          python src/main.py "Input_data/data.sql"
           cat *_SearchKeywordPerformance.tab

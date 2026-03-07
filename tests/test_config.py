@@ -13,6 +13,8 @@ class TestLoadConfig:
         assert "site_domain" in config
         assert "search_engine_domains" in config
         assert "keyword_params" in config
+        assert "Input_folder" in config
+        assert "data_file" in config
 
     def test_default_has_expected_values(self):
         config = load_config()
@@ -26,10 +28,14 @@ class TestLoadConfig:
             'site_domain = "test.com"\n'
             'search_engine_domains = ["google"]\n'
             'keyword_params = ["q"]\n'
+            'Input_folder = "input"\n'
+            'data_file = "data.csv"\n'
         )
         config = load_config(custom)
         assert config["site_domain"] == "test.com"
         assert config["search_engine_domains"] == ["google"]
+        assert config["Input_folder"] == "input"
+        assert config["data_file"] == "data.csv"
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
